@@ -323,9 +323,110 @@ read_raw_super_block()从设备读取super_block信息。
 
 
 ## 4. 文件系统读写
-### 4.1 文件读过程代码分析
-读文件从sys_read函数开始。
-- sys_read()
-	根据文件ID获得文件结构的指针；其次取得文件的当前位置；最后调用vfs_read()执行文件读；完成后，将更新的文件当前位置写入文件指针。
-- vfs_read()
-	调用到file->f_op->read,执行具体文件系统的读函数。如ext2的generic_file_read()
+### 4.1 文件的访问
+访问文件时，struct file、 super_block、inode、dentry、address_space结构重要。
+打开文件：
+sys_open -> do_filp_open -> path_openat -> do_last -> lookup_dcache ->d_alloc ->__d_alloc
+### 4.2 文件的打开
+在fs/open.c中
+```c
+SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
+{	if (force_o_largefile())
+		flags |= O_LARGEFILE;
+	return do_sys_open(AT_FDCWD, filename, flags, mode);
+}
+```
+do_sys_open():
+```c
+struct file *f = do_filp_open(dfd, struct filename tmp, &op);
+```
+fs/namei.c中do_filp_open():得到struct file filp的指针。
+```c
+filp = path_openat(&nd, op, flags | LOOKUP_RCU);
+```
+在open.c的do_dentry_open()中赋值
+```c
+f->f_op = fops_get(inode->i_fop);
+```
+### 4.3 文件的读操作
+1. VFS读部分：
+在fs/read_write.c中
+```c
+SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+	struct fd f = fdget_pos(fd);
+	if (f.file) {
+		loff_t pos = file_pos_read(f.file);
+		ret = vfs_read(f.file, buf, count, &pos);
+		if (ret >= 0)
+			file_pos_write(f.file, pos);
+		fdput_pos(f);
+	}
+	return ret;
+}
+```
+vfs_read(struct file, char *, size_t, loff_t):
+```c
+ret = rw_verify_area(READ, file, pos, count);
+ret = __vfs_read(file, buf, count, pos);
+```
+__vfs_read():
+```c
+//如果文件定义了read函数，调用文件自身的读函数。
+	if (file->f_op->read)
+		return file->f_op->read(file, buf, count, pos);
+	else if (file->f_op->read_iter)
+		return new_sync_read(file, buf, count, pos);
+```
+2. f2fs读操作
+f->f_op = inode->i_fop;而inode的->i_fop。 操作赋值在f2fs/inode.c的f2fs_iget()函数中
+```c
+make_now:
+	if (ino == F2FS_NODE_INO(sbi)) {
+		inode->i_mapping->a_ops = &f2fs_node_aops;
+		mapping_set_gfp_mask(inode->i_mapping, GFP_F2FS_ZERO);
+	} else if (ino == F2FS_META_INO(sbi)) {
+		inode->i_mapping->a_ops = &f2fs_meta_aops;
+		mapping_set_gfp_mask(inode->i_mapping, GFP_F2FS_ZERO);
+	} else if (S_ISREG(inode->i_mode)) {
+		inode->i_op = &f2fs_file_inode_operations;
+		inode->i_fop = &f2fs_file_operations;
+		inode->i_mapping->a_ops = &f2fs_dblock_aops;
+	} else if (S_ISDIR(inode->i_mode)) {
+		inode->i_op = &f2fs_dir_inode_operations;
+		inode->i_fop = &f2fs_dir_operations;
+		inode->i_mapping->a_ops = &f2fs_dblock_aops;
+		mapping_set_gfp_mask(inode->i_mapping, GFP_F2FS_HIGH_ZERO);
+	} else if (S_ISLNK(inode->i_mode)) {
+		if (f2fs_encrypted_inode(inode))
+			inode->i_op = &f2fs_encrypted_symlink_inode_operations;
+		else
+			inode->i_op = &f2fs_symlink_inode_operations;
+		inode_nohighmem(inode);
+		inode->i_mapping->a_ops = &f2fs_dblock_aops;
+	} else if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
+			S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode)) {
+		inode->i_op = &f2fs_special_inode_operations;
+		init_special_inode(inode, inode->i_mode, inode->i_rdev);
+}
+```
+普通文件的读写操作函数如下(file.c):
+```c
+const struct file_operations f2fs_file_operations = {
+	.llseek		= f2fs_llseek,
+	.read_iter	= generic_file_read_iter,
+	.write_iter	= f2fs_file_write_iter,
+	.open		= f2fs_file_open,
+	.release	= f2fs_release_file,
+	.mmap		= f2fs_file_mmap,
+	.flush		= f2fs_file_flush,
+	.fsync		= f2fs_sync_file,
+	.fallocate	= f2fs_fallocate,
+	.unlocked_ioctl	= f2fs_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= f2fs_compat_ioctl,
+#endif
+	.splice_read	= generic_file_splice_read,
+	.splice_write	= iter_file_splice_write,
+};
+```

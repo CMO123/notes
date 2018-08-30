@@ -7,14 +7,14 @@ static int f2fs_fill_super(struct super_block *sb, void *data, int silent)
 	
 try_onemore:
 part-1:
-	/* 为f2fs-specific super block info分配内存 */
+	/* 1. 为f2fs-specific super block info分配内存 */
 	sbi = kzalloc(sizeof(struct f2fs_sb_info), GFP_KERNEL);
 	sbi->sb = sb;
 	/* Load the checksum driver */
 	sbi->s_chksum_driver = crypto_alloc_shash("crc32", 0, 0);	
-	/* 设置一个block size */
+	/* 2. 设置一个block size */
 	if (unlikely(!sb_set_blocksize(sb, F2FS_BLKSIZE))) {}
-	//从设备中读取super_block信息，获得row_super,valid_super_block,recovery的值，传入sbi为了获得sb->s_bdev和sb->s_blocksize
+	//3. 从设备中读取super_block信息，获得row_super,valid_super_block,recovery的值，传入sbi为了获得sb->s_bdev和sb->s_blocksize
 	err = read_raw_super_block(sbi, &raw_super, &valid_super_block,
 								&recovery);
 		
@@ -55,7 +55,8 @@ part-1:
 								}
 
 part-2:
-	//	s_fs_info与文件系统类型相关，不同文件系统该信息不同，但都保存到超级块的sb->s_fs_info中.
+	//s_fs_info与文件系统类型相关，不同文件系统该信息不同，但都保存到超级块的sb->s_fs_info中.
+	// 1. 设置sbi参数
 	sb->s_fs_info = sbi;
 	sbi->raw_super = raw_super;
 	sbi->s_resuid = make_kuid(&init_user_ns, F2FS_DEF_RESUID);
@@ -87,6 +88,7 @@ part-2:
 										leaf_count *= NIDS_PER_BLOCK;
 										result += leaf_count;
 										}
+	//2. 设置sb参数
 	sb->s_maxbytes = sbi->max_file_blocks <<
 				le32_to_cpu(raw_super->log_blocksize);
 	sb->s_max_links = F2FS_LINK_MAX;//0xffffffff
@@ -132,32 +134,23 @@ part-2:
 	sb->s_iflags |= SB_I_CGROUPWB;
 
 	/* init f2fs-specific super block info */
+	// 3. 初始化f2fs特定的super block info
 	sbi->valid_super_block = valid_super_block;
 	mutex_init(&sbi->gc_mutex);
 	mutex_init(&sbi->cp_mutex);
 	init_rwsem(&sbi->node_write);
 	init_rwsem(&sbi->node_change);
-
 	/* disallow all the data/node/meta page writes */
 	set_sbi_flag(sbi, SBI_POR_DOING);
 	spin_lock_init(&sbi->stat_lock);
-
 	/* init iostat info */
 	spin_lock_init(&sbi->iostat_lock);
 	sbi->iostat_enable = false;
-
 	for (i = 0; i < NR_PAGE_TYPE; i++) {
 		int n = (i == META) ? 1: NR_TEMP_TYPE;
 		int j;
 
-		sbi->write_io[i] = f2fs_kmalloc(sbi,
-					n * sizeof(struct f2fs_bio_info),
-					GFP_KERNEL);
-		if (!sbi->write_io[i]) {
-			err = -ENOMEM;
-			goto free_options;
-		}
-
+		sbi->write_io[i] = f2fs_kmalloc(sbi, n * sizeof(struct f2fs_bio_info), GFP_KERNEL);		
 		for (j = HOT; j < n; j++) {
 			init_rwsem(&sbi->write_io[i][j].io_rwsem);
 			sbi->write_io[i][j].sbi = sbi;
@@ -170,8 +163,51 @@ part-2:
 	init_rwsem(&sbi->cp_rwsem);
 	init_waitqueue_head(&sbi->cp_wait);
 	init_sb_info(sbi);
+						{//根据raw_super中信息填充sbi
+						struct f2fs_super_block *raw_super = sbi->raw_super;
+						int i, j;
+						sbi->log_sectors_per_block =
+							le32_to_cpu(raw_super->log_sectors_per_block);
+						sbi->log_blocksize = le32_to_cpu(raw_super->log_blocksize);
+						sbi->blocksize = 1 << sbi->log_blocksize;
+						sbi->log_blocks_per_seg = le32_to_cpu(raw_super->log_blocks_per_seg);
+						sbi->blocks_per_seg = 1 << sbi->log_blocks_per_seg;
+						sbi->segs_per_sec = le32_to_cpu(raw_super->segs_per_sec);
+						sbi->secs_per_zone = le32_to_cpu(raw_super->secs_per_zone);
+						sbi->total_sections = le32_to_cpu(raw_super->section_count);
+						sbi->total_node_count =
+							(le32_to_cpu(raw_super->segment_count_nat) / 2)
+								* sbi->blocks_per_seg * NAT_ENTRY_PER_BLOCK;
+						sbi->root_ino_num = le32_to_cpu(raw_super->root_ino);
+						sbi->node_ino_num = le32_to_cpu(raw_super->node_ino);
+						sbi->meta_ino_num = le32_to_cpu(raw_super->meta_ino);
+						sbi->cur_victim_sec = NULL_SECNO;
+						sbi->max_victim_search = DEF_MAX_VICTIM_SEARCH;
+
+						sbi->dir_level = DEF_DIR_LEVEL;
+						sbi->interval_time[CP_TIME] = DEF_CP_INTERVAL;
+						sbi->interval_time[REQ_TIME] = DEF_IDLE_INTERVAL;
+						clear_sbi_flag(sbi, SBI_NEED_FSCK);
+
+						for (i = 0; i < NR_COUNT_TYPE; i++)
+							atomic_set(&sbi->nr_pages[i], 0);
+
+						atomic_set(&sbi->wb_sync_req, 0);
+
+						INIT_LIST_HEAD(&sbi->s_list);
+						mutex_init(&sbi->umount_mutex);
+						for (i = 0; i < NR_PAGE_TYPE - 1; i++)
+							for (j = HOT; j < NR_TEMP_TYPE; j++)
+								mutex_init(&sbi->wio_mutex[i][j]);
+						spin_lock_init(&sbi->cp_lock);
+
+						sbi->dirty_device = 0;
+						spin_lock_init(&sbi->dev_lock);
+						}
 
 	err = init_percpu_info(sbi);
+							percpu_counter_init(&sbi->alloc_valid_block_count, 0, GFP_KERNEL);
+							percpu_counter_init(&sbi->total_valid_inode_count, 0, GFP_KERNEL);
 	if (err)
 		goto free_bio_info;
 
@@ -207,241 +243,69 @@ part-2:
 	}
 
 	sbi->total_valid_node_count =
-				le32_to_cpu(sbi->ckpt->valid_node_count);
+				le32_to_cpu(sbi->ckpt->valid_node_count);	//0x1
 	percpu_counter_set(&sbi->total_valid_inode_count,
 				le32_to_cpu(sbi->ckpt->valid_inode_count));
-	sbi->user_block_count = le64_to_cpu(sbi->ckpt->user_block_count);
+	sbi->user_block_count = le64_to_cpu(sbi->ckpt->user_block_count);	//0x36400
 	sbi->total_valid_block_count =
-				le64_to_cpu(sbi->ckpt->valid_block_count);
-	sbi->last_valid_block_count = sbi->total_valid_block_count;
+				le64_to_cpu(sbi->ckpt->valid_block_count);		//0x2
+	sbi->last_valid_block_count = sbi->total_valid_block_count;	//0x2
 	sbi->reserved_blocks = 0;
 	sbi->current_reserved_blocks = 0;
 	limit_reserve_root(sbi);
-
+	//4个不同的inode_list
 	for (i = 0; i < NR_INODE_TYPE; i++) {
 		INIT_LIST_HEAD(&sbi->inode_list[i]);
 		spin_lock_init(&sbi->inode_lock[i]);
 	}
 
 	init_extent_cache_info(sbi);
+								{
+								INIT_RADIX_TREE(&sbi->extent_tree_root, GFP_NOIO);
+								atomic_set(&sbi->total_ext_tree, 0);
+								atomic_set(&sbi->total_zombie_tree, 0);
+								atomic_set(&sbi->total_ext_node, 0);
+								}
 
 	init_ino_entry_info(sbi);
 
+
+part-3:
 	/* setup f2fs internal modules */
+	// 1. 建立f2fs内部模块
 	err = build_segment_manager(sbi);
-	if (err) {
-		f2fs_msg(sb, KERN_ERR,
-			"Failed to initialize F2FS segment manager");
-		goto free_sm;
-	}
 	err = build_node_manager(sbi);
-	if (err) {
-		f2fs_msg(sb, KERN_ERR,
-			"Failed to initialize F2FS node manager");
-		goto free_nm;
-	}
-
-	/* For write statistics */
-	if (sb->s_bdev->bd_part)
-		sbi->sectors_written_start =
-			(u64)part_stat_read(sb->s_bdev->bd_part, sectors[1]);
-
 	/* Read accumulated write IO statistics if exists */
 	seg_i = CURSEG_I(sbi, CURSEG_HOT_NODE);
 	if (__exist_node_summaries(sbi))
 		sbi->kbytes_written =
 			le64_to_cpu(seg_i->journal->info.kbytes_written);
-
 	build_gc_manager(sbi);
-
 	/* get an inode for node space */
 	sbi->node_inode = f2fs_iget(sb, F2FS_NODE_INO(sbi));
-	if (IS_ERR(sbi->node_inode)) {
-		f2fs_msg(sb, KERN_ERR, "Failed to read node inode");
-		err = PTR_ERR(sbi->node_inode);
-		goto free_nm;
-	}
-
 	err = f2fs_build_stats(sbi);
-	if (err)
-		goto free_node_inode;
-
 	/* read root inode and dentry */
-	/*
-	该函数能够查询特定超级块下指定inode number的inode。如果inode number不存在，则创建新的inode，并将inode number赋值给新的inode.
-	一般来说系统都用类似的jffs2_iget->iget_locked/ubifs_iget->iget_locked来创建新inode，或查询已存在的inode。
-	每个超级块都存在一个root inode,其中结点号是inode->i_ino=1，返回值是超级块的根节点inode。
-	*/
 	root = f2fs_iget(sb, F2FS_ROOT_INO(sbi));
-	if (IS_ERR(root)) {
-		f2fs_msg(sb, KERN_ERR, "Failed to read root inode");
-		err = PTR_ERR(root);
-		goto free_stats;
-	}
-	if (!S_ISDIR(root->i_mode) || !root->i_blocks || !root->i_size) {
-		iput(root);
-		err = -EINVAL;
-		goto free_node_inode;
-	}
 	//每个超级块都存在一个root inode对应的目录项dentry,其中结点号是dentry->d_iname="/"
 	sb->s_root = d_make_root(root); /* allocate root dentry */
-	if (!sb->s_root) {
-		err = -ENOMEM;
-		goto free_root_inode;
-	}
-
 	err = f2fs_register_sysfs(sbi);
-	if (err)
-		goto free_root_inode;
-
-#ifdef CONFIG_QUOTA
-	/*
-	 * Turn on quotas which were not enabled for read-only mounts if
-	 * filesystem has quota feature, so that they are updated correctly.
-	 */
-	if (f2fs_sb_has_quota_ino(sb) && !sb_rdonly(sb)) {
-		err = f2fs_enable_quotas(sb);
-		if (err) {
-			f2fs_msg(sb, KERN_ERR,
-				"Cannot turn on quotas: error %d", err);
-			goto free_sysfs;
-		}
-	}
-#endif
 	/* if there are nt orphan nodes free them */
 	err = recover_orphan_inodes(sbi);
-	if (err)
-		goto free_meta;
-
 	/* recover fsynced data */
-	if (!test_opt(sbi, DISABLE_ROLL_FORWARD)) {
-		/*
-		 * mount should be failed, when device has readonly mode, and
-		 * previous checkpoint was not done by clean system shutdown.
-		 */
-		if (bdev_read_only(sb->s_bdev) &&
-				!is_set_ckpt_flags(sbi, CP_UMOUNT_FLAG)) {
-			err = -EROFS;
-			goto free_meta;
-		}
-
-		if (need_fsck)
-			set_sbi_flag(sbi, SBI_NEED_FSCK);
-
-		if (!retry)
-			goto skip_recovery;
-
-		err = recover_fsync_data(sbi, false);
-		if (err < 0) {
-			need_fsck = true;
-			f2fs_msg(sb, KERN_ERR,
-				"Cannot recover all fsync data errno=%d", err);
-			goto free_meta;
-		}
-	} else {
-		err = recover_fsync_data(sbi, true);
-
-		if (!f2fs_readonly(sb) && err > 0) {
-			err = -EINVAL;
-			f2fs_msg(sb, KERN_ERR,
-				"Need to recover fsync data");
-			goto free_meta;
-		}
-	}
+	...
 skip_recovery:
 	/* recover_fsync_data() cleared this already */
 	clear_sbi_flag(sbi, SBI_POR_DOING);
-
-	/*
-	 * If filesystem is not mounted as read-only then
-	 * do start the gc_thread.
-	 */
 	if (test_opt(sbi, BG_GC) && !f2fs_readonly(sb)) {
-		/* After POR, we can run background GC thread.*/
 		err = start_gc_thread(sbi);
-		if (err)
-			goto free_meta;
 	}
-	kfree(options);
-
 	/* recover broken superblock */
 	if (recovery) {
 		err = f2fs_commit_super(sbi, true);
-		f2fs_msg(sb, KERN_INFO,
-			"Try to recover %dth superblock, ret: %d",
-			sbi->valid_super_block ? 1 : 2, err);
 	}
-
 	f2fs_join_shrinker(sbi);
-
-	f2fs_msg(sbi->sb, KERN_NOTICE, "Mounted with checkpoint version = %llx",
-				cur_cp_version(F2FS_CKPT(sbi)));
 	f2fs_update_time(sbi, CP_TIME);
 	f2fs_update_time(sbi, REQ_TIME);
 	return 0;
-
-free_meta:
-#ifdef CONFIG_QUOTA
-	if (f2fs_sb_has_quota_ino(sb) && !sb_rdonly(sb))
-		f2fs_quota_off_umount(sbi->sb);
-#endif
-	f2fs_sync_inode_meta(sbi);
-	/*
-	 * Some dirty meta pages can be produced by recover_orphan_inodes()
-	 * failed by EIO. Then, iput(node_inode) can trigger balance_fs_bg()
-	 * followed by write_checkpoint() through f2fs_write_node_pages(), which
-	 * falls into an infinite loop in sync_meta_pages().
-	 */
-	truncate_inode_pages_final(META_MAPPING(sbi));
-#ifdef CONFIG_QUOTA
-free_sysfs:
-#endif
-	f2fs_unregister_sysfs(sbi);
-free_root_inode:
-	dput(sb->s_root);
-	sb->s_root = NULL;
-free_stats:
-	f2fs_destroy_stats(sbi);
-free_node_inode:
-	release_ino_entry(sbi, true);
-	truncate_inode_pages_final(NODE_MAPPING(sbi));
-	iput(sbi->node_inode);
-free_nm:
-	destroy_node_manager(sbi);
-free_sm:
-	destroy_segment_manager(sbi);
-free_devices:
-	destroy_device_list(sbi);
-	kfree(sbi->ckpt);
-free_meta_inode:
-	make_bad_inode(sbi->meta_inode);
-	iput(sbi->meta_inode);
-free_io_dummy:
-	mempool_destroy(sbi->write_io_dummy);
-free_percpu:
-	destroy_percpu_info(sbi);
-free_bio_info:
-	for (i = 0; i < NR_PAGE_TYPE; i++)
-		kfree(sbi->write_io[i]);
-free_options:
-#ifdef CONFIG_QUOTA
-	for (i = 0; i < MAXQUOTAS; i++)
-		kfree(sbi->s_qf_names[i]);
-#endif
-	kfree(options);
-free_sb_buf:
-	kfree(raw_super);
-free_sbi:
-	if (sbi->s_chksum_driver)
-		crypto_free_shash(sbi->s_chksum_driver);
-	kfree(sbi);
-
-	/* give only one another chance */
-	if (retry) {
-		retry = false;
-		shrink_dcache_sb(sb);
-		goto try_onemore;
-	}
-	return err;
 }
 
