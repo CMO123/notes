@@ -367,17 +367,30 @@ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 ```
 vfs_read(struct file, char *, size_t, loff_t):
 ```c
-ret = rw_verify_area(READ, file, pos, count);
+ret = rw_verify_area(READ, file, pos, count);//检查权限
 ret = __vfs_read(file, buf, count, pos);
 ```
 __vfs_read():
 ```c
 //如果文件定义了read函数，调用文件自身的读函数。
-	if (file->f_op->read)
+	if (file->f_op->read)//在linux3.16后文件系统的file_operations操作一般已经不使用操作read函数操作了
 		return file->f_op->read(file, buf, count, pos);
 	else if (file->f_op->read_iter)
 		return new_sync_read(file, buf, count, pos);
 ```
+参考https://blog.csdn.net/u013837209/article/details/54923508
+调用调用调用到
+```c
+ret = filp->f_op->read_iter(&kiocb, &iter);
+   -->generic_file_read_iter
+	//分为DIRECT 和 使用缓存
+
+	最后调用
+	mapping->a_ops->readpages
+	或者
+	mapping->a_ops->readpage
+	进行读取操作
+```	 
 2. f2fs读操作
 f->f_op = inode->i_fop;而inode的->i_fop。 操作赋值在f2fs/inode.c的f2fs_iget()函数中
 ```c
@@ -410,23 +423,23 @@ make_now:
 		init_special_inode(inode, inode->i_mode, inode->i_rdev);
 }
 ```
-普通文件的读写操作函数如下(file.c):
+ino为普通文件或者目录时，如果使用高速缓存读，则其操作函数为f2fs_dblock_aops如下：
 ```c
-const struct file_operations f2fs_file_operations = {
-	.llseek		= f2fs_llseek,
-	.read_iter	= generic_file_read_iter,
-	.write_iter	= f2fs_file_write_iter,
-	.open		= f2fs_file_open,
-	.release	= f2fs_release_file,
-	.mmap		= f2fs_file_mmap,
-	.flush		= f2fs_file_flush,
-	.fsync		= f2fs_sync_file,
-	.fallocate	= f2fs_fallocate,
-	.unlocked_ioctl	= f2fs_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= f2fs_compat_ioctl,
+const struct address_space_operations f2fs_dblock_aops = {
+	.readpage	= f2fs_read_data_page,
+	.readpages	= f2fs_read_data_pages,
+	.writepage	= f2fs_write_data_page,
+	.writepages	= f2fs_write_data_pages,
+	.write_begin	= f2fs_write_begin,
+	.write_end	= f2fs_write_end,
+	.set_page_dirty	= f2fs_set_data_page_dirty,
+	.invalidatepage	= f2fs_invalidate_page,
+	.releasepage	= f2fs_release_page,
+	.direct_IO	= f2fs_direct_IO,
+	.bmap		= f2fs_bmap,
+#ifdef CONFIG_MIGRATION
+	.migratepage    = f2fs_migrate_page,
 #endif
-	.splice_read	= generic_file_splice_read,
-	.splice_write	= iter_file_splice_write,
 };
 ```
+所以需要修改的函数，包括各个node和meta和数据的读写操作函数。
